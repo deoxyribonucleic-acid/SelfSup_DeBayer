@@ -38,7 +38,7 @@ def interp(bayer):
     # plot_channel(bayer)
     interp_8bit = np.copy(np.array(bayer, dtype=np.uint8))
     interp_10bit = (interp_8bit.astype(np.uint16) * 4)
-    (B,G,R) = cv2.split(interp_10bit)
+    (B,G,R) = cv2.split(interp_8bit)
 
     # Interpolate blue, last col and first row is all 0
     B = np.pad(B, 1)

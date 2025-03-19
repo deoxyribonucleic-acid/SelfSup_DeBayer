@@ -1,0 +1,6 @@
+data/validation/
+data/train/
+data/test/
+
+saved_models/
+*__pycache__*
