@@ -23,8 +23,8 @@ import blind2unblind.model.utils as util
 from collections import OrderedDict
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--noisetype", type=str, default="gauss25", choices=['gauss25', 'gauss5_50', 'poisson30', 'poisson5_50'])
-parser.add_argument('--checkpoint', type=str, default='./*.pth')
+parser.add_argument("--noisetype", type=str, default="gauss5_50", choices=['gauss25', 'gauss5_50', 'poisson30', 'poisson5_50'])
+parser.add_argument('--checkpoint', type=str, default='./saved_models/g5-50_112rf20_beta19.4.pth')
 parser.add_argument('--test_dirs', type=str, default='./data/validation')
 parser.add_argument('--save_test_path', type=str, default='./test')
 parser.add_argument('--log_name', type=str, default='b2u_unet_g25_112rf20')
@@ -32,13 +32,16 @@ parser.add_argument('--gpu_devices', default='0', type=str)
 parser.add_argument('--parallel', action='store_true')
 parser.add_argument('--n_feature', type=int, default=48)
 parser.add_argument('--n_channel', type=int, default=3)
-parser.add_argument("--beta", type=float, default=20.0)
+parser.add_argument("--beta", type=float, default=19.4)
 
 opt, _ = parser.parse_known_args()
 systime = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
 operation_seed_counter = 0
 os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_devices
 torch.set_num_threads(8)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('mps' if torch.mps.is_available() else 'cpu')
 
 # config loggers. Before it, the log will not work
 os.makedirs(opt.save_test_path, exist_ok=True)
@@ -89,7 +92,7 @@ def load_network(load_path, network, strict=True):
 def get_generator():
     global operation_seed_counter
     operation_seed_counter += 1
-    g_cuda_generator = torch.Generator(device="cuda")
+    g_cuda_generator = torch.Generator(device=device)
     g_cuda_generator.manual_seed(operation_seed_counter)
     return g_cuda_generator
 
@@ -119,7 +122,7 @@ class AugmentNoise(object):
         if self.style == "gauss_fix":
             std = self.params[0]
             std = std * torch.ones((shape[0], 1, 1, 1), device=x.device)
-            noise = torch.cuda.FloatTensor(shape, device=x.device)
+            noise = torch.FloatTensor(shape, device=x.device)
             torch.normal(mean=0.0,
                          std=std,
                          generator=get_generator(),
@@ -129,7 +132,7 @@ class AugmentNoise(object):
             min_std, max_std = self.params
             std = torch.rand(size=(shape[0], 1, 1, 1),
                              device=x.device) * (max_std - min_std) + min_std
-            noise = torch.cuda.FloatTensor(shape, device=x.device)
+            noise = torch.FloatTensor(shape, device=x.device)
             torch.normal(mean=0, std=std, generator=get_generator(), out=noise)
             return x + noise
         elif self.style == "poisson_fix":
@@ -444,16 +447,18 @@ def calculate_psnr(target, ref, data_range=255.0):
 
 # Validation Set
 Kodak_dir = os.path.join(opt.test_dirs, "Kodak24")
-BSD300_dir = os.path.join(opt.test_dirs, "BSD300")
-Set14_dir = os.path.join(opt.test_dirs, "Set14")
+# BSD300_dir = os.path.join(opt.test_dirs, "BSD300")
+# Set14_dir = os.path.join(opt.test_dirs, "Set14")
 valid_dict = {
     "Kodak24": validation_kodak(Kodak_dir),
-    "BSD300": validation_bsd300(BSD300_dir),
-    "Set14": validation_Set14(Set14_dir)
+    # "BSD300": validation_bsd300(BSD300_dir),
+    # "Set14": validation_Set14(Set14_dir)
 }
 
 # Noise adder
-noise_adder = AugmentNoise(style=opt.noisetype)
+# noise_adder = AugmentNoise(style=opt.noisetype)
+from preprocessing import bayernoise
+noise_adder = bayernoise
 # Masker
 masker = Masker(width=4, mode='interpolate', mask_type='all')
 # Network
@@ -462,7 +467,7 @@ network = UNet(in_channels=opt.n_channel,
                 wf=opt.n_feature)
 if opt.parallel:
     network = torch.nn.DataParallel(network)
-network = network.cuda()
+network = network.to(device)
 # load pre-trained model
 network = load_network(opt.checkpoint, network, strict=True)
 beta = opt.beta
@@ -475,7 +480,7 @@ validation_path = os.path.join(save_test_path, "validation")
 os.makedirs(validation_path, exist_ok=True)
 np.random.seed(101)
 # valid_repeat_times = {"Kodak24": 1, "BSD300": 1, "Set14": 1}
-valid_repeat_times = {"Kodak24": 10, "BSD300": 3, "Set14": 20}
+valid_repeat_times = {"Kodak24": 1} #, "BSD300": 3, "Set14": 20}
 
 for valid_name, valid_images in valid_dict.items():
     save_dir = os.path.join(validation_path, valid_name)
@@ -492,8 +497,9 @@ for valid_name, valid_images in valid_dict.items():
         for idx, im in enumerate(valid_images):
             origin255 = im.copy()
             origin255 = origin255.astype(np.uint8)
-            im = np.array(im, dtype=np.float32) / 255.0
-            noisy_im = noise_adder.add_valid_noise(im)
+            noisy_im = noise_adder(im)
+            noisy_im = np.array(noisy_im, dtype=np.float32) / 255.0
+            # noisy_im = noise_adder.add_valid_noise(im)
             noisy255 = noisy_im.copy()
             noisy255 = np.clip(noisy255 * 255.0 + 0.5, 0,
                                 255).astype(np.uint8)
@@ -508,7 +514,7 @@ for valid_name, valid_images in valid_dict.items():
             transformer = transforms.Compose([transforms.ToTensor()])
             noisy_im = transformer(noisy_im)
             noisy_im = torch.unsqueeze(noisy_im, 0)
-            noisy_im = noisy_im.cuda()
+            noisy_im = noisy_im.to(device)
             with torch.no_grad():
                 n, c, h, w = noisy_im.shape
                 net_input, mask = masker.train(noisy_im)

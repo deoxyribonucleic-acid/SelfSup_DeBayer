@@ -18,7 +18,12 @@ class ImageDataset(Dataset):
     
     def __getitem__(self, idx):
         img = cv2.imread(self.input[idx], cv2.IMREAD_UNCHANGED)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (512, 512))
+        name = os.path.basename(self.input[idx])
+        # convert to [0,1]
+        img = img / 255.0
         if self.is_clean:
-            return ToTensor()(interp(bayer_filter(img)))
+            return ToTensor()(interp(bayer_filter(img))), name
         else:
-            return ToTensor()(img)
+            return ToTensor()(img), name

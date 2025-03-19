@@ -4,3 +4,5 @@ data/test/
 
 saved_models/
 *__pycache__*
+test/
+output/

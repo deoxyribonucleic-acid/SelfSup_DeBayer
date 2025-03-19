@@ -2,11 +2,11 @@ import cv2
 import preprocessing as pp
 import metrics as mt
 
-path = 'kodim01.png'
+path = 'data/validation/Kodak24/kodim01.png'
 
 img = cv2.imread(path)
 
-bayer = pp.bayer_filter(path)
+bayer = pp.bayer_filter(img)
 
 rec = pp.interp(bayer)
 
