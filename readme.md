@@ -3,12 +3,12 @@
 
 Project for Umich ECE 556 *Image Processing* WN 2025
 ## Getting Started
-- For installing the environment and train the model, please run the command twice
+- For installing the environment and training the model, please run the command twice
 
   ```shell
   bash train_grbg.sh
   ```
-- For testing the mode, please run the command
+- For testing the model, please run the command
 
   ```shell
   bash test_grbg.sh
