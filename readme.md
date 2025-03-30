@@ -3,6 +3,19 @@
 
 Project for Umich ECE 556 *Image Processing* WN 2025
 ## Getting Started
+- For installing the environment and train the model, please run the command twice
+
+  ```shell
+  bash train_grbg.sh
+  ```
+- For testing the mode, please run the command
+
+  ```shell
+  bash test_grbg.sh
+  ```
 
 ## Credit
 This project borrowed heavily on [Blind2Unblind](https://github.com/zejinwang/Blind2Unblind).
+
+## Test Results and Pre-trained Models
+https://drive.google.com/drive/folders/1UTlv8_rJ-MGKN70ApReHKhJbgy7GYAVi
