@@ -6,3 +6,5 @@ saved_models/
 *__pycache__*
 test/
 output/
+*.csv
+.DS_Store

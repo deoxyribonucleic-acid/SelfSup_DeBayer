@@ -1,0 +1,504 @@
+from __future__ import division
+import os
+import random
+import logging
+import glob
+import datetime
+import argparse
+import numpy as np
+from scipy.io import loadmat, savemat
+
+import cv2
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+from torchvision import transforms
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+
+from blind2unblind.model.arch_unet import UNet
+import blind2unblind.model.utils as util
+from collections import OrderedDict
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--resume', type=str)
+parser.add_argument('--checkpoint', type=str)
+parser.add_argument('--data_dir', type=str, default='./data/train/SIDD_Medium_Raw_noisy_sub512')
+parser.add_argument('--val_dirs', type=str, default='./data/validation')
+parser.add_argument('--save_model_path', type=str, default='../experiments/results')
+parser.add_argument('--log_name', type=str, default='b2u_new_mask')
+parser.add_argument('--gpu_devices', default='0', type=str)
+parser.add_argument('--parallel', action='store_true')
+parser.add_argument('--n_feature', type=int, default=48)
+parser.add_argument('--in_channel', type=int, default=4)
+parser.add_argument('--out_channel', type=int, default=3)
+parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--w_decay', type=float, default=1e-8)
+parser.add_argument('--gamma', type=float, default=0.5)
+parser.add_argument('--n_epoch', type=int, default=100)
+parser.add_argument('--n_snapshot', type=int, default=1)
+parser.add_argument('--batchsize', type=int, default=4)
+parser.add_argument('--use_mask', action='store_true', help='是否使用边界 mask')
+parser.add_argument('--remosaic_mode', type=str, default='multi', choices=['single', 'multi', 'random'], help='控制 remosaic 的 pattern 模式')
+
+opt, _ = parser.parse_known_args()
+systime = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
+operation_seed_counter = 0
+os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_devices
+torch.set_num_threads(8)
+
+# config loggers. Before it, the log will not work
+opt.save_path = os.path.join(opt.save_model_path, opt.log_name, systime)
+os.makedirs(opt.save_path, exist_ok=True)
+util.setup_logger(
+    "train",
+    opt.save_path,
+    "train_" + opt.log_name,
+    level=logging.INFO,
+    screen=True,
+    tofile=True,
+)
+logger = logging.getLogger("train")
+
+
+def save_network(network, epoch, name):
+    save_path = os.path.join(opt.save_path, 'models')
+    os.makedirs(save_path, exist_ok=True)
+    model_name = 'epoch_{}_{:03d}.pth'.format(name, epoch)
+    save_path = os.path.join(save_path, model_name)
+    if isinstance(network, nn.DataParallel) or isinstance(
+        network, nn.parallel.DistributedDataParallel
+    ):
+        network = network.module
+    state_dict = network.state_dict()
+    for key, param in state_dict.items():
+        state_dict[key] = param.cpu()
+    torch.save(state_dict, save_path)
+    logger.info('Checkpoint saved to {}'.format(save_path))
+
+
+def load_network(load_path, network, strict=True):
+    assert load_path is not None
+    logger.info("Loading model from [{:s}] ...".format(load_path))
+    if isinstance(network, nn.DataParallel) or isinstance(
+        network, nn.parallel.DistributedDataParallel
+    ):
+        network = network.module
+    load_net = torch.load(load_path)
+    load_net_clean = OrderedDict()  # remove unnecessary 'module.'
+    for k, v in load_net.items():
+        if k.startswith("module."):
+            load_net_clean[k[7:]] = v
+        else:
+            load_net_clean[k] = v
+    network.load_state_dict(load_net_clean, strict=strict)
+    return network
+
+def save_state(epoch, optimizer, scheduler):
+    """Saves training state during training, which will be used for resuming"""
+    save_path = os.path.join(opt.save_path, 'training_states')
+    os.makedirs(save_path, exist_ok=True)
+    state = {"epoch": epoch, "scheduler": scheduler.state_dict(), 
+                                            "optimizer": optimizer.state_dict()}
+    save_filename = "{}.state".format(epoch)
+    save_path = os.path.join(save_path, save_filename)
+    torch.save(state, save_path)
+
+def resume_state(load_path, optimizer, scheduler):
+    """Resume the optimizers and schedulers for training"""
+    resume_state = torch.load(load_path)
+    epoch = resume_state["epoch"]
+    resume_optimizer = resume_state["optimizer"]
+    resume_scheduler = resume_state["scheduler"]
+    optimizer.load_state_dict(resume_optimizer)
+    scheduler.load_state_dict(resume_scheduler)
+    return epoch, optimizer, scheduler
+
+def checkpoint(net, epoch, name):
+    save_model_path = os.path.join(opt.save_model_path, opt.log_name, systime)
+    os.makedirs(save_model_path, exist_ok=True)
+    model_name = 'epoch_{}_{:03d}.pth'.format(name, epoch)
+    save_model_path = os.path.join(save_model_path, model_name)
+    torch.save(net.state_dict(), save_model_path)
+    print('Checkpoint saved to {}'.format(save_model_path))
+
+class BayerPatternShifter:
+    """
+    提供 Bayer pattern 的空间平移与 remosaic 重建功能。
+    支持 pattern: RGGB, GRBG, GBRG, BGGR
+    """
+
+    def __init__(self, pattern='RGGB'):
+        self.pattern = pattern
+        self.offset_map = {
+            'RGGB': (0, 0),
+            'GRBG': (0, 1),
+            'GBRG': (1, 0),
+            'BGGR': (1, 1)
+        }
+
+    def shift_bayer(self, bayer_img, target_pattern):
+        """
+        将 Bayer 图像从当前 pattern 转为目标 pattern（实现 T_i）
+        输入: bayer_img: (1, H, W) tensor
+        返回: 平移后的 bayer_img
+        """
+        dx, dy = self.offset_map[target_pattern]
+        return bayer_img[..., dx:, dy:]
+
+    def inverse_shift(self, shifted_img, target_pattern):
+        """
+        将 shift_bayer 后的图像恢复到原始对齐（实现 T_i^-1）
+        返回: 恢复后的图像，padding 边缘补0
+        """
+        dx, dy = self.offset_map[target_pattern]
+        B, H, W = shifted_img.shape
+        out = torch.zeros((B, H + dx, W + dy), device=shifted_img.device)
+        out[..., dx:, dy:] = shifted_img
+        return out
+
+    def remosaic(self, rgb_img, target_pattern):
+        """
+        将 RGB 图 remosaic 成 Bayer 图（实现 P_i）
+        输入: rgb_img: (3, H, W)
+        输出: bayer_img: (1, H, W)
+        """
+        R = rgb_img[0]
+        G = rgb_img[1]
+        B = rgb_img[2]
+        H, W = R.shape
+        bayer = torch.zeros((1, H, W), device=rgb_img.device)
+
+        dx, dy = self.offset_map[target_pattern]
+
+        bayer[0, dx::2, dy::2] = R[dx::2, dy::2]
+        bayer[0, dx::2, 1-dy::2] = G[dx::2, 1-dy::2]
+        bayer[0, 1-dx::2, dy::2] = G[1-dx::2, dy::2]
+        bayer[0, 1-dx::2, 1-dy::2] = B[1-dx::2, 1-dy::2]
+
+        return bayer
+
+def space_to_depth(x, block_size):
+    n, c, h, w = x.size()
+    unfolded_x = torch.nn.functional.unfold(x, block_size, stride=block_size)
+    return unfolded_x.view(n, c * block_size**2, h // block_size,
+                           w // block_size)
+
+class DataLoader_Imagenet_val(Dataset):
+    def __init__(self, data_dir, patch=256):
+        super(DataLoader_Imagenet_val, self).__init__()
+        self.data_dir = data_dir
+        self.patch = patch
+        self.train_fns = glob.glob(os.path.join(self.data_dir, "*"))
+        self.train_fns.sort()
+        print('fetch {} samples for training'.format(len(self.train_fns)))
+
+    def __getitem__(self, index):
+        # fetch image
+        fn = self.train_fns[index]
+        im = Image.open(fn)
+        im = np.array(im, dtype=np.float32)
+        # random crop
+        H = im.shape[0]
+        W = im.shape[1]
+        if H - self.patch > 0:
+            xx = np.random.randint(0, H - self.patch)
+            im = im[xx:xx + self.patch, :, :]
+        if W - self.patch > 0:
+            yy = np.random.randint(0, W - self.patch)
+            im = im[:, yy:yy + self.patch, :]
+        # np.ndarray to torch.tensor
+        transformer = transforms.Compose([transforms.ToTensor()])
+        im = transformer(im)
+        return im
+
+    def __len__(self):
+        return len(self.train_fns)
+
+
+class DataLoader_SIDD_Medium_Raw(Dataset):
+    def __init__(self, data_dir):
+        super(DataLoader_SIDD_Medium_Raw, self).__init__()
+        self.data_dir = data_dir
+        # get images path
+        self.train_fns = glob.glob(os.path.join(self.data_dir, "*"))
+        self.train_fns.sort()
+        print('fetch {} samples for training'.format(len(self.train_fns)))
+
+    def __getitem__(self, index):
+        # fetch image
+        fn = self.train_fns[index]
+        im = loadmat(fn)["x"]
+        # random crop
+        H, W = im.shape
+        CSize = 256
+        rnd_h = np.random.randint(0, max(0, H - CSize))
+        rnd_w = np.random.randint(0, max(0, W - CSize))
+        im = im[rnd_h : rnd_h + CSize, rnd_w : rnd_w + CSize]
+        im = im[np.newaxis, :, :]
+        im = torch.from_numpy(im)
+        return im
+
+    def __len__(self):
+        return len(self.train_fns)
+
+def get_SIDD_validation(dataset_dir):
+    val_data_dict = loadmat(
+        os.path.join(dataset_dir, "ValidationNoisyBlocksRaw.mat"))
+    val_data_noisy = val_data_dict['ValidationNoisyBlocksRaw']
+    val_data_dict = loadmat(
+        os.path.join(dataset_dir, 'ValidationGtBlocksSrgb.mat'))  # 用 RGB GT
+    val_data_gt = val_data_dict['ValidationGtBlocksSrgb']
+    num_img, num_block, _, _ = val_data_gt.shape
+    return num_img, num_block, val_data_noisy, val_data_gt
+
+
+def validation_kodak(dataset_dir):
+    fns = glob.glob(os.path.join(dataset_dir, "*"))
+    fns.sort()
+    images = []
+    for fn in fns:
+        im = Image.open(fn)
+        im = np.array(im, dtype=np.float32)
+        images.append(im)
+    return images
+
+
+def validation_bsd300(dataset_dir):
+    fns = []
+    fns.extend(glob.glob(os.path.join(dataset_dir, "test", "*")))
+    fns.sort()
+    images = []
+    for fn in fns:
+        im = Image.open(fn)
+        im = np.array(im, dtype=np.float32)
+        images.append(im)
+    return images
+
+
+def validation_Set14(dataset_dir):
+    fns = glob.glob(os.path.join(dataset_dir, "*"))
+    fns.sort()
+    images = []
+    for fn in fns:
+        im = Image.open(fn)
+        im = np.array(im, dtype=np.float32)
+        images.append(im)
+    return images
+
+
+def ssim(prediction, target):
+    C1 = (0.01 * 255)**2
+    C2 = (0.03 * 255)**2
+    img1 = prediction.astype(np.float64)
+    img2 = target.astype(np.float64)
+    kernel = cv2.getGaussianKernel(11, 1.5)
+    window = np.outer(kernel, kernel.transpose())
+    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]  # valid
+    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+    mu1_sq = mu1**2
+    mu2_sq = mu2**2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = cv2.filter2D(img1**2, -1, window)[5:-5, 5:-5] - mu1_sq
+    sigma2_sq = cv2.filter2D(img2**2, -1, window)[5:-5, 5:-5] - mu2_sq
+    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+    ssim_map = ((2 * mu1_mu2 + C1) *
+                (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) *
+                                       (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
+
+
+def calculate_ssim(target, ref):
+    '''
+    calculate SSIM
+    the same outputs as MATLAB's
+    img1, img2: [0, 255]
+    '''
+    img1 = np.array(target, dtype=np.float64)
+    img2 = np.array(ref, dtype=np.float64)
+    if not img1.shape == img2.shape:
+        raise ValueError('Input images must have the same dimensions.')
+    if img1.ndim == 2:
+        return ssim(img1, img2)
+    elif img1.ndim == 3:
+        if img1.shape[2] == 3:
+            ssims = []
+            for i in range(3):
+                ssims.append(ssim(img1[:, :, i], img2[:, :, i]))
+            return np.array(ssims).mean()
+        elif img1.shape[2] == 1:
+            return ssim(np.squeeze(img1), np.squeeze(img2))
+    else:
+        raise ValueError('Wrong input image dimensions.')
+
+
+def calculate_psnr(target, ref, data_range=255.0):
+    img1 = np.array(target, dtype=np.float32)
+    img2 = np.array(ref, dtype=np.float32)
+    diff = img1 - img2
+    psnr = 10.0 * np.log10(data_range**2 / np.mean(np.square(diff)))
+    return psnr
+
+
+def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, opt):
+    """Training loop for the model."""
+    for epoch in range(epoch_init, num_epoch + 1):
+        for param_group in optimizer.param_groups:
+            current_lr = param_group['lr']
+        print("LearningRate of Epoch {} = {}".format(epoch, current_lr))
+
+        network.train()
+        for iteration, noisy in enumerate(TrainingLoader):
+            optimizer.zero_grad()
+            shifter = BayerPatternShifter()
+
+            # Step 1: I → I_D
+            I = noisy.cuda()  # [N,1,H,W]
+            I_pack = space_to_depth(I, 2)  # [N,3,H/2,W/2]
+            I_D = network(I_pack)  # → [N,3,H/2,W/2]
+
+            # Multi Bayer Pattern Self-Supervised Loop
+            if opt.remosaic_mode == 'single':
+                patterns = ['GRBG']
+            elif opt.remosaic_mode == 'multi':
+                patterns = ['GRBG', 'GBRG', 'BGGR']
+            elif opt.remosaic_mode == 'random':
+                patterns = [random.choice(['GRBG', 'GBRG', 'BGGR'])]
+            total_loss = 0
+
+            for pat in patterns:
+                I_i = [shifter.remosaic(rgb, pat) for rgb in I_D]
+                I_i = torch.stack(I_i)
+                I_i_pack = space_to_depth(I_i, 2)
+                I_D_tilde = network(I_i_pack)
+                I_hat = [shifter.remosaic(rgb, 'RGGB') for rgb in I_D_tilde]
+                I_hat = torch.stack(I_hat)
+                if opt.use_mask:
+                    valid_mask = torch.ones_like(I)
+                    valid_mask[..., :1, :] = 0
+                    valid_mask[..., -1:, :] = 0
+                    valid_mask[..., :, :1] = 0
+                    valid_mask[..., :, -1:] = 0
+                    total_loss += torch.sum(((I_hat - I) ** 2) * valid_mask) / torch.sum(valid_mask)
+                else:
+                    total_loss += torch.mean((I_hat - I) ** 2)
+
+            loss_all = total_loss / len(patterns)
+            loss_all.backward()
+            optimizer.step()
+
+        scheduler.step()
+
+        if epoch % opt.n_snapshot == 0 or epoch == opt.n_epoch:
+            save_network(network, epoch, "model")
+            save_state(epoch, optimizer, scheduler)
+
+def validate(network, valid_dict, opt, systime, epoch):
+    """Validation loop with RGB prediction and RGB ground truth."""
+    network.eval()
+    save_model_path = os.path.join(opt.save_model_path, opt.log_name, systime)
+    validation_path = os.path.join(save_model_path, "validation_rgb")
+    os.makedirs(validation_path, exist_ok=True)
+    np.random.seed(101)
+
+    for valid_name, valid_data in valid_dict.items():
+        avg_psnr = []
+        avg_ssim = []
+        save_dir = os.path.join(validation_path, valid_name)
+        os.makedirs(save_dir, exist_ok=True)
+        num_img, num_block, val_noisy, val_gt = valid_data
+
+        for idx in range(num_img):
+            for idy in range(num_block):
+                gt = val_gt[idx, idy] / 255.0  # shape [H, W, 3]
+                noisy = val_noisy[idx, idy][:, :, np.newaxis]  # shape [H, W, 1]
+
+                transformer = transforms.Compose([transforms.ToTensor()])
+                noisy_tensor = transformer(noisy).unsqueeze(0).cuda()  # [1, 1, H, W]
+                noisy_tensor = space_to_depth(noisy_tensor, 2)  # [1, 4, H/2, W/2]
+
+                with torch.no_grad():
+                    pred_rgb = network(noisy_tensor)  # [1, 3, H, W]
+
+                pred_rgb = pred_rgb.permute(0, 2, 3, 1).cpu().clamp(0, 1).numpy().squeeze(0)
+                pred255 = np.clip(pred_rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+                psnr = calculate_psnr(gt.astype(np.float32), pred_rgb.astype(np.float32), 1.0)
+                ssim = calculate_ssim(gt * 255.0, pred_rgb * 255.0)
+                avg_psnr.append(psnr)
+                avg_ssim.append(ssim)
+
+                save_path = os.path.join(save_dir, f"{valid_name}_{idx:03d}-{idy:03d}-{epoch}_rgb.png")
+                Image.fromarray(pred255).save(save_path)
+
+        avg_psnr = np.mean(avg_psnr)
+        avg_ssim = np.mean(avg_ssim)
+
+        log_path = os.path.join(validation_path, f"A_log_{valid_name}.csv")
+        with open(log_path, "a") as f:
+            f.write(f"epoch:{epoch},psnr:{avg_psnr:.6f},ssim:{avg_ssim:.6f}\n")
+
+
+if __name__ == "__main__":
+    # Training Set
+    TrainingDataset = DataLoader_SIDD_Medium_Raw(opt.data_dir)
+    TrainingLoader = DataLoader(dataset=TrainingDataset,
+                                num_workers=8,
+                                batch_size=opt.batchsize,
+                                shuffle=True,
+                                pin_memory=False,
+                                drop_last=True)
+
+    # Validation Set
+    valid_dict = {
+        "SIDD_Val": get_SIDD_validation(opt.val_dirs)
+    }
+
+    # Network
+    network = UNet(in_channels=opt.in_channel,
+                    out_channels=opt.out_channel,
+                    wf=opt.n_feature)
+    if opt.parallel:
+        network = torch.nn.DataParallel(network)
+    network = network.cuda()
+
+    # Training scheme
+    num_epoch = opt.n_epoch
+    ratio = num_epoch / 100
+    optimizer = optim.Adam(network.parameters(), lr=opt.lr, weight_decay=opt.w_decay)
+    scheduler = lr_scheduler.MultiStepLR(optimizer,
+                                         milestones=[
+                                             int(20 * ratio) - 1,
+                                             int(40 * ratio) - 1,
+                                             int(60 * ratio) - 1,
+                                             int(80 * ratio) - 1
+                                         ],
+                                         gamma=opt.gamma)
+    print("Batchsize={}, number of epoch={}".format(opt.batchsize, opt.n_epoch))
+
+    # Resume and load pre-trained model
+    epoch_init = 1
+    if opt.resume is not None:
+        epoch_init, optimizer, scheduler = resume_state(opt.resume, optimizer, scheduler)
+    if opt.checkpoint is not None:
+        network = load_network(opt.checkpoint, network, strict=True)
+
+    # Adjust scheduler for resumed training
+    if opt.checkpoint is not None:
+        epoch_init = 41
+        for i in range(1, epoch_init):
+            scheduler.step()
+            new_lr = scheduler.get_lr()[0]
+            logger.info('----------------------------------------------------')
+            logger.info("==> Resuming Training with learning rate:{}".format(new_lr))
+            logger.info('----------------------------------------------------')
+
+    print('init finish')
+
+    # Training
+    train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, opt)
+
+    # Validation
+    validate(network, valid_dict, opt, systime, num_epoch)
