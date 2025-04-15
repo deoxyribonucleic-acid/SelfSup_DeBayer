@@ -29,6 +29,7 @@ python train_new.py \
     --out_channel 3 \
     --n_feature 48 \
     --batchsize 16 \
-    --n_epoch 100 \
+    --n_epoch 200 \
+    --warmup_epoch 40 \
     --use_mask \
-    --remosaic_mode multi
+    --remosaic_mode 'random'

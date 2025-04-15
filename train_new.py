@@ -15,9 +15,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
+import torch.nn.functional as F
 from torchvision import transforms
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 from blind2unblind.model.arch_unet import UNet
 import blind2unblind.model.utils as util
@@ -38,28 +38,18 @@ parser.add_argument('--out_channel', type=int, default=3)
 parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--w_decay', type=float, default=1e-8)
 parser.add_argument('--gamma', type=float, default=0.5)
-parser.add_argument('--n_epoch', type=int, default=100)
+parser.add_argument('--n_epoch', type=int, default=200)
 parser.add_argument('--n_snapshot', type=int, default=1)
 parser.add_argument('--batchsize', type=int, default=4)
-parser.add_argument('--use_mask', action='store_true', help='是否使用边界 mask')
-parser.add_argument('--remosaic_mode', type=str, default='multi', choices=['single', 'multi', 'random'], help='控制 remosaic 的 pattern 模式')
-parser.add_argument("--Lambda1", type=float, default=1.0)
-parser.add_argument("--Lambda2", type=float, default=2.0)
-parser.add_argument("--increase_ratio", type=float, default=20.0)
+parser.add_argument('--use_mask', action='store_true', help='use edge mask or not')
+parser.add_argument('--remosaic_mode', type=str, default='random,', choices=['single', 'random'], help='remosaic pattern')
+parser.add_argument('--warmup_epoch', type=int, default=20)
 
 opt, _ = parser.parse_known_args()
 systime = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
-operation_seed_counter = 0
 os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_devices
 torch.set_num_threads(8)
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-Thread1 = 0.4
-Thread2 = 1.0
-Lambda1 = opt.Lambda1
-Lambda2 = opt.Lambda2
-increase_ratio = opt.increase_ratio
 
 # config loggers. Before it, the log will not work
 opt.save_path = os.path.join(opt.save_model_path, opt.log_name, systime)
@@ -73,7 +63,6 @@ util.setup_logger(
     tofile=True,
 )
 logger = logging.getLogger("train")
-
 
 def save_network(network, epoch, name):
     save_path = os.path.join(opt.save_path, 'models')
@@ -89,7 +78,6 @@ def save_network(network, epoch, name):
         state_dict[key] = param.cpu()
     torch.save(state_dict, save_path)
     logger.info('Checkpoint saved to {}'.format(save_path))
-
 
 def load_network(load_path, network, strict=True):
     assert load_path is not None
@@ -137,10 +125,6 @@ def checkpoint(net, epoch, name):
     print('Checkpoint saved to {}'.format(save_model_path))
 
 class BayerPatternShifter:
-    """
-    提供 Bayer pattern 的空间平移与 remosaic 重建功能。
-    支持 pattern: RGGB, GRBG, GBRG, BGGR
-    """
 
     def __init__(self, pattern='RGGB'):
         self.pattern = pattern
@@ -152,19 +136,12 @@ class BayerPatternShifter:
         }
 
     def shift_bayer(self, bayer_img, target_pattern):
-        """
-        将 Bayer 图像从当前 pattern 转为目标 pattern（实现 T_i）
-        输入: bayer_img: (1, H, W) tensor
-        返回: 平移后的 bayer_img
-        """
+        
         dx, dy = self.offset_map[target_pattern]
         return bayer_img[..., dx:, dy:]
 
     def inverse_shift(self, shifted_img, target_pattern):
-        """
-        将 shift_bayer 后的图像恢复到原始对齐（实现 T_i^-1）
-        返回: 恢复后的图像，padding 边缘补0
-        """
+
         dx, dy = self.offset_map[target_pattern]
         B, H, W = shifted_img.shape
         out = torch.zeros((B, H + dx, W + dy), device=shifted_img.device)
@@ -173,9 +150,9 @@ class BayerPatternShifter:
 
     def remosaic(self, rgb_img, target_pattern, out_channel=1):
         """
-        将 RGB 图 remosaic 成 Bayer 图（实现 P_i）
-        输入: rgb_img: (3, H, W)
-        输出: bayer_img: (1, H, W)
+        Converts an RGB image into a Bayer image (implements P_i).
+        Input: rgb_img: (3, H, W)
+        Output: bayer_img: (1, H, W)
         """
         R = rgb_img[0]
         G = rgb_img[1]
@@ -184,6 +161,7 @@ class BayerPatternShifter:
         bayer = torch.zeros((out_channel, H, W), device=rgb_img.device)
 
         dx, dy = self.offset_map[target_pattern]
+
         if out_channel == 1:
             bayer[0, dx::2, dy::2] = R[dx::2, dy::2]
             bayer[0, dx::2, 1-dy::2] = G[dx::2, 1-dy::2]
@@ -201,20 +179,21 @@ class BayerPatternShifter:
 
         return bayer
     
-    def bayer_1ch_to_4ch(self, bayer_img):
-        """
-        将 Bayer 图像从 1 通道转换为 4 通道
-        输入: bayer_img: (B, 1, H, W) tensor
-        返回: 4 通道的 bayer_img (B, 4, H, W)
-        """
-        B, _, H, W = bayer_img.shape
-        bayer_4ch = torch.zeros((B, 4, H, W), device=bayer_img.device)
-        bayer_4ch[:, 0, :, :] = bayer_img[:, 0, :, :]
-        bayer_4ch[:, 1, :, :] = bayer_img[:, 0, :, :]
-        bayer_4ch[:, 2, :, :] = bayer_img[:, 0, :, :]
-        bayer_4ch[:, 3, :, :] = bayer_img[:, 0, :, :]
+    def bayer_1ch_to_4ch(self, x):
 
-        return bayer_4ch
+        B, _, H, W = x.shape
+        out = torch.zeros(B, 4, H, W, device=x.device)
+        out[:, 0, 0::2, 0::2] = x[:, 0, 0::2, 0::2]
+        out[:, 1, 0::2, 1::2] = x[:, 0, 0::2, 1::2]
+        out[:, 2, 1::2, 0::2] = x[:, 0, 1::2, 0::2]
+        out[:, 3, 1::2, 1::2] = x[:, 0, 1::2, 1::2]
+
+        return out
+
+
+def bilinear_demosaic(bayer):
+    return F.interpolate(bayer, scale_factor=1, mode='bilinear', align_corners=False).repeat(1, 3, 1, 1)
+
 
 # def space_to_depth(x, block_size):
 #     n, c, h, w = x.size()
@@ -280,17 +259,6 @@ class DataLoader_SIDD_Medium_Raw(Dataset):
     def __len__(self):
         return len(self.train_fns)
 
-def get_SIDD_validation(dataset_dir):
-    val_data_dict = loadmat(
-        os.path.join(dataset_dir, "ValidationNoisyBlocksRaw.mat"))
-    val_data_noisy = val_data_dict['ValidationNoisyBlocksRaw']
-    val_data_dict = loadmat(
-        os.path.join(dataset_dir, 'ValidationGtBlocksSrgb.mat'))  # 用 RGB GT
-    val_data_gt = val_data_dict['ValidationGtBlocksSrgb']
-    num_img, num_block, _, _ = val_data_gt.shape
-    return num_img, num_block, val_data_noisy, val_data_gt
-
-
 def validation_kodak(dataset_dir):
     fns = glob.glob(os.path.join(dataset_dir, "*"))
     fns.sort()
@@ -300,30 +268,6 @@ def validation_kodak(dataset_dir):
         im = np.array(im, dtype=np.float32)
         images.append(im)
     return images
-
-
-def validation_bsd300(dataset_dir):
-    fns = []
-    fns.extend(glob.glob(os.path.join(dataset_dir, "test", "*")))
-    fns.sort()
-    images = []
-    for fn in fns:
-        im = Image.open(fn)
-        im = np.array(im, dtype=np.float32)
-        images.append(im)
-    return images
-
-
-def validation_Set14(dataset_dir):
-    fns = glob.glob(os.path.join(dataset_dir, "*"))
-    fns.sort()
-    images = []
-    for fn in fns:
-        im = Image.open(fn)
-        im = np.array(im, dtype=np.float32)
-        images.append(im)
-    return images
-
 
 def ssim(prediction, target):
     C1 = (0.01 * 255)**2
@@ -386,55 +330,48 @@ def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, 
         print("LearningRate of Epoch {} = {}".format(epoch, current_lr))
 
         network.train()
-        for iteration, noisy in tqdm(enumerate(TrainingLoader), total=len(TrainingLoader)):
+        for iteration, I in tqdm(enumerate(TrainingLoader), total=len(TrainingLoader)):
             optimizer.zero_grad()
             shifter = BayerPatternShifter()
 
-            # Step 1: I → I_D
-            I = noisy.to(device)  # [N,1,H,W]
-            I_pack = shifter.bayer_1ch_to_4ch(I)  # [N,4,H,W] 
-            # print("I_pack shape: ", I_pack.shape)
-            I_D = network(I_pack)  # → [N,3,H/2,W/2]
-            exp_loss = torch.mean((I_D - I) ** 2)
+            I = I.to(device)  # [N,1,H,W] 
+            I_4ch = shifter.bayer_1ch_to_4ch(I)  # [N,4,H,W] 
+            pred_rgb = network(I_4ch)
 
-            # Multi Bayer Pattern Self-Supervised Loop
-            if opt.remosaic_mode == 'single':
-                patterns = ['GRBG']
-            elif opt.remosaic_mode == 'multi':
-                patterns = ['GRBG', 'GBRG', 'BGGR']
-            elif opt.remosaic_mode == 'random':
-                patterns = [random.choice(['GRBG', 'GBRG', 'BGGR'])]
-            total_loss = 0
+            # warm up stage: learn to remosaic
+            if epoch <= opt.warmup_epoch:
+                target_rgb = bilinear_demosaic(I)
+                loss = F.mse_loss(pred_rgb, target_rgb)
+            else:
+               # Self-supervised remosaic stage
+                if opt.remosaic_mode == 'single':
+                    pat = 'GRBG'
+                elif opt.remosaic_mode == 'random':
+                    pat = random.choice(['GRBG', 'GBRG', 'BGGR'])
 
-            for pat in patterns:
-                I_i = [shifter.remosaic(rgb, pat, 4) for rgb in I_D]
-                # print("I_i shape: ", I_i[0].shape)
+                I_i = [shifter.remosaic(rgb, pat, 4) for rgb in pred_rgb] # remosaic model output
                 I_i = torch.stack(I_i)
-                # I_i_pack = space_to_depth(I_i, 2)
+
+                # re-predict
                 I_D_tilde = network(I_i)
-                I_hat = [shifter.remosaic(rgb, 'RGGB', 4) for rgb in I_D_tilde]
+                
+                # back to RGGB
+                I_hat = [shifter.remosaic(rgb, 'RGGB', 1) for rgb in I_D_tilde] # size [N,1,H,W], dense Bayer F
                 I_hat = torch.stack(I_hat)
+                
                 if opt.use_mask:
                     valid_mask = torch.ones_like(I)
                     valid_mask[..., :1, :] = 0
                     valid_mask[..., -1:, :] = 0
                     valid_mask[..., :, :1] = 0
                     valid_mask[..., :, -1:] = 0
-                    total_loss += torch.sum(((I_hat - I) ** 2) * valid_mask) / torch.sum(valid_mask)
+                # loss
+                if valid_mask is not None:
+                    loss = F.mse_loss(I_hat * valid_mask, I * valid_mask)
                 else:
-                    total_loss += torch.mean((I_hat - I) ** 2)
+                    loss = F.mse_loss(I_hat, I)
 
-            Lambda = epoch / opt.n_epoch
-            if Lambda <= Thread1:
-                beta = Lambda2
-            elif Thread1 <= Lambda <= Thread2:
-                beta = Lambda2 + (Lambda - Thread1) * \
-                    (increase_ratio-Lambda2) / (Thread2-Thread1)
-            else:
-                beta = increase_ratio
-
-            loss_all = total_loss / len(patterns) + beta * exp_loss
-            loss_all.backward()
+            loss.backward()
             optimizer.step()
 
         scheduler.step()
