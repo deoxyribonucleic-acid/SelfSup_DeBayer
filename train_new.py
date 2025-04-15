@@ -114,6 +114,7 @@ def resume_state(load_path, optimizer, scheduler):
     resume_scheduler = resume_state["scheduler"]
     optimizer.load_state_dict(resume_optimizer)
     scheduler.load_state_dict(resume_scheduler)
+    logger.info("Resume training from epoch {}".format(epoch))
     return epoch, optimizer, scheduler
 
 def checkpoint(net, epoch, name):
@@ -179,7 +180,8 @@ class BayerPatternShifter:
 
         return bayer
     
-    def bayer_1ch_to_4ch(self, x):
+    @staticmethod
+    def bayer_1ch_to_4ch(x):
 
         B, _, H, W = x.shape
         out = torch.zeros(B, 4, H, W, device=x.device)
@@ -190,10 +192,29 @@ class BayerPatternShifter:
 
         return out
 
+def bilinear_demosaic_rggb(bayer):
+    B, H, W = bayer.shape
+    print(bayer.shape)
+    
+    # 初始化 RGB 通道
+    R = torch.zeros_like(bayer)
+    G = torch.zeros_like(bayer)
+    B_ = torch.zeros_like(bayer)
 
-def bilinear_demosaic(bayer):
-    return F.interpolate(bayer, scale_factor=1, mode='bilinear', align_corners=False).repeat(1, 3, 1, 1)
+    # 从 Bayer pattern 中提取通道分布
+    R[:, 0::2, 0::2] = bayer[:, 0::2, 0::2]
+    G[:, 0::2, 1::2] = bayer[:, 0::2, 1::2]
+    G[:, 1::2, 0::2] = bayer[:, 1::2, 0::2]
+    B_[:, 1::2, 1::2] = bayer[:, 1::2, 1::2]
 
+    # 插值空位置
+    R = F.interpolate(R.unsqueeze(1), scale_factor=1, mode='bilinear', align_corners=False)
+    G = F.interpolate(G.unsqueeze(1), scale_factor=1, mode='bilinear', align_corners=False)
+    B_ = F.interpolate(B_.unsqueeze(1), scale_factor=1, mode='bilinear', align_corners=False)
+
+    # 拼接成 RGB
+    rgb = torch.cat([R, G, B_], dim=1)  # [B, 3, H, W]
+    return rgb
 
 # def space_to_depth(x, block_size):
 #     n, c, h, w = x.size()
@@ -350,7 +371,7 @@ def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, 
 
             # warm up stage: learn to remosaic
             if epoch <= opt.warmup_epoch:
-                target_rgb = bilinear_demosaic(I)
+                target_rgb = bilinear_demosaic_rggb(I) # I must in RGGB format, 1 channel
                 loss = F.mse_loss(pred_rgb, target_rgb)
             else:
                # Self-supervised remosaic stage
@@ -386,13 +407,13 @@ def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, 
 
         scheduler.step()
 
-        if epoch % opt.n_snapshot == 0 or epoch == opt.n_epoch:
+        if epoch % opt.n_snapshot == 0 or epoch == opt.n_epoch or epoch == opt.warmup_epoch:
             save_network(network, epoch, "model")
             save_state(epoch, optimizer, scheduler)
             # print log
             logger.info("===> Train Epoch[{}]: Loss: {:.6f}".format(epoch, loss.item()))
 
-            validate(network, valid_dict, opt, systime, epoch)
+            # validate(network, valid_dict, opt, systime, epoch)
 
 
 def validate(network, valid_dict, opt, systime, epoch):
@@ -418,6 +439,7 @@ def validate(network, valid_dict, opt, systime, epoch):
                 transformer = transforms.Compose([transforms.ToTensor()])
                 noisy_tensor = transformer(noisy).unsqueeze(0).to(device)  # [1, 1, H, W]
                 # noisy_tensor = space_to_depth(noisy_tensor, 2)  # [1, 4, H/2, W/2]
+                noisy_tensor = BayerPatternShifter.bayer_1ch_to_4ch(noisy_tensor)  # [1, 4, H, W]
 
                 with torch.no_grad():
                     pred_rgb = network(noisy_tensor)  # [1, 3, H, W]
@@ -484,16 +506,6 @@ if __name__ == "__main__":
         epoch_init, optimizer, scheduler = resume_state(opt.resume, optimizer, scheduler)
     if opt.checkpoint is not None:
         network = load_network(opt.checkpoint, network, strict=True)
-
-    # Adjust scheduler for resumed training
-    if opt.checkpoint is not None:
-        epoch_init = 41
-        for i in range(1, epoch_init):
-            scheduler.step()
-            new_lr = scheduler.get_lr()[0]
-            logger.info('----------------------------------------------------')
-            logger.info("==> Resuming Training with learning rate:{}".format(new_lr))
-            logger.info('----------------------------------------------------')
 
     print('init finish')
 

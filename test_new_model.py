@@ -3,12 +3,27 @@ import os
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
-from train_new import UNet, space_to_depth, get_SIDD_validation, calculate_psnr, calculate_ssim
+from train_new import UNet, get_SIDD_validation, calculate_psnr, calculate_ssim, BayerPatternShifter, bilinear_demosaic
 from torchvision import transforms
 from PIL import Image
+from scipy.io import loadmat
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def get_SIDD_validation(dataset_dir):
+    val_data_dict = loadmat(
+        os.path.join(dataset_dir, "ValidationNoisyBlocksRaw.mat"))
+    val_data_noisy = val_data_dict['ValidationNoisyBlocksRaw']
+    val_data_dict = loadmat(
+        os.path.join(dataset_dir, 'ValidationGtBlocksSrgb.mat'))
+    val_data_gt = val_data_dict['ValidationGtBlocksSrgb']
+    # print(val_data_gt.shape)
+    num_img, num_block, _, _, _ = val_data_gt.shape
+    return num_img, num_block, val_data_noisy, val_data_gt
+
 
 def test(model_path, data_dir, out_dir):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet(in_channels=4, out_channels=3, wf=48).to(device)
     model.load_state_dict(torch.load(model_path))
     model.eval()
@@ -18,14 +33,15 @@ def test(model_path, data_dir, out_dir):
 
     psnr_list, ssim_list = [], []
 
-    for idx in range(num_img):
-        for idy in range(num_block):
+    for idx in tqdm(range(num_img), desc="Testing", unit="image"):
+        for idy in tqdm(range(num_block), desc="Processing blocks", unit="block"):
             gt = val_gt[idx, idy] / 255.0  # [H, W, 3]
+            # print(gt.shape)
             noisy = val_noisy[idx, idy][:, :, np.newaxis]  # [H, W, 1]
 
             transformer = transforms.Compose([transforms.ToTensor()])
             noisy_tensor = transformer(noisy).unsqueeze(0).to(device)
-            noisy_tensor = space_to_depth(noisy_tensor, 2)  # [1, 4, H/2, W/2]
+            noisy_tensor = BayerPatternShifter.bayer_1ch_to_4ch(noisy_tensor)
 
             with torch.no_grad():
                 pred_rgb = model(noisy_tensor)
@@ -45,9 +61,17 @@ def test(model_path, data_dir, out_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, required=True, help='Path to trained model (.pth)')
-    parser.add_argument('--data_dir', type=str, required=True, help='Path to validation data folder')
+    parser.add_argument('--checkpoint', type=str, required=True, help='Path to trained model (.pth)')
+    parser.add_argument('--test_dir', type=str, required=True, help='Path to validation data folder')
     parser.add_argument('--out_dir', type=str, default='./test_results', help='Directory to save predictions')
     args = parser.parse_args()
 
-    test(args.model, args.data_dir, args.out_dir)
+    # test(args.checkpoint, args.test_dir, args.out_dir)
+
+    test_im = Image.open('./data/validation/koidim01.png')
+    shifter = BayerPatternShifter()
+    test_im = test_im.convert('RGB')
+    test_im = np.array(test_im)
+    bayer_f = shifter.remosaic(test_im, 'RGGB', out_channel=4)
+    simple_demosaic = bilinear_demosaic(bayer_f)
+    

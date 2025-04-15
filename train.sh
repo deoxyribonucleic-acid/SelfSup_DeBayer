@@ -11,25 +11,27 @@
 #SBATCH --mail-user=ruijiech@umich.edu   
 
 # ====== 环境 ======
-source /home/ruijiech/.bashrc
-cd /home/ruijiech/SelfSup_DeBayer/
-conda activate 556-proj   
+# source /home/ethan/.bashrc
+# cd /home/ethan/SelfSup_DeBayer/
+# conda activate 556
 
 # ====== 日志目录创建 ======
 mkdir -p logs
 
 # ====== 训练命令======
 python train_new.py \
-    --data_dir ./data/train/SIDD_Medium_Raw_noisy_sub512 \
-    --val_dirs ./data/validation \
+    --data_dir ./data/train/SIDD_Medium_Raw_noisy_sub512_rggb/ \
+    --val_dirs ./data/validation/SIDD_Validation_Blocks/ \
     --save_model_path ../experiments/results \
     --log_name b2u_new_mask \
     --gpu_devices 0 \
     --in_channel 4 \
     --out_channel 3 \
     --n_feature 48 \
-    --batchsize 32 \
+    --batchsize 4 \
     --n_epoch 100 \
-    --warmup_epoch 20 \
     --use_mask \
-    --remosaic_mode 'random'
+    --remosaic_mode random \
+    --warmup_epoch 20 \
+    --resume /home/ethan/Code/experiments/results/b2u_new_mask/2025-04-15-03-56/training_states/20.state \
+    --checkpoint /home/ethan/Code/experiments/results/b2u_new_mask/2025-04-15-03-56/models/epoch_model_020.pth
