@@ -7,12 +7,12 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 
 
-data_dir = "/YourPath/SIDD_Medium_Raw/Data"
+data_dir = "/scratch/eecs556w25_class_root/eecs556w25_class/ruijiech/SIDD_Medium_Raw/Data/"
 path_all_noisy = glob(os.path.join(data_dir, '**/*NOISY*.MAT'), recursive=True) # GT or NOISY
 path_all_noisy = sorted(path_all_noisy)
 print('Number of big images: {:d}'.format(len(path_all_noisy)))
 
-save_folder = "./data/train/SIDD_Medium_Raw_noisy_sub512" # gt or noisy
+save_folder = "/scratch/eecs556w25_class_root/eecs556w25_class/ruijiech/data/train/SIDD_Medium_Raw_noisy_sub512" # gt or noisy
 if os.path.exists(save_folder):
     os.system("rm -r {}".format(save_folder))
 os.makedirs(save_folder)   

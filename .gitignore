@@ -8,3 +8,4 @@ test/
 output/
 *.csv
 .DS_Store
+data

@@ -45,6 +45,7 @@ class UNet(nn.Module):
             x = up(x, blocks[-i-1])
 
         out = self.last(x)
+
         return out
 
 
@@ -83,6 +84,17 @@ class UP(nn.Module):
         x = self.conv_2(x)
 
         return x
+
+def bayer_to_4ch_conv(x):
+    # x: [N,1,H,W]
+    kernel = torch.zeros(4, 1, 2, 2, device=x.device)
+    # RGGB pattern
+    kernel[0, 0, 0, 0] = 1.0  # R
+    kernel[1, 0, 0, 1] = 1.0  # G1
+    kernel[2, 0, 1, 0] = 1.0  # G2
+    kernel[3, 0, 1, 1] = 1.0  # B
+
+    return torch.nn.functional.conv2d(x, kernel, stride=1, padding=1)
 
 
 def conv1x1(in_chn, out_chn, bias=True):

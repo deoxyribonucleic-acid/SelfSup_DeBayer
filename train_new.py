@@ -6,6 +6,7 @@ import glob
 import datetime
 import argparse
 import numpy as np
+from tqdm import tqdm
 from scipy.io import loadmat, savemat
 
 import cv2
@@ -42,12 +43,23 @@ parser.add_argument('--n_snapshot', type=int, default=1)
 parser.add_argument('--batchsize', type=int, default=4)
 parser.add_argument('--use_mask', action='store_true', help='是否使用边界 mask')
 parser.add_argument('--remosaic_mode', type=str, default='multi', choices=['single', 'multi', 'random'], help='控制 remosaic 的 pattern 模式')
+parser.add_argument("--Lambda1", type=float, default=1.0)
+parser.add_argument("--Lambda2", type=float, default=2.0)
+parser.add_argument("--increase_ratio", type=float, default=20.0)
 
 opt, _ = parser.parse_known_args()
 systime = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
 operation_seed_counter = 0
 os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_devices
 torch.set_num_threads(8)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+Thread1 = 0.4
+Thread2 = 1.0
+Lambda1 = opt.Lambda1
+Lambda2 = opt.Lambda2
+increase_ratio = opt.increase_ratio
 
 # config loggers. Before it, the log will not work
 opt.save_path = os.path.join(opt.save_model_path, opt.log_name, systime)
@@ -159,7 +171,7 @@ class BayerPatternShifter:
         out[..., dx:, dy:] = shifted_img
         return out
 
-    def remosaic(self, rgb_img, target_pattern):
+    def remosaic(self, rgb_img, target_pattern, out_channel=1):
         """
         将 RGB 图 remosaic 成 Bayer 图（实现 P_i）
         输入: rgb_img: (3, H, W)
@@ -169,22 +181,46 @@ class BayerPatternShifter:
         G = rgb_img[1]
         B = rgb_img[2]
         H, W = R.shape
-        bayer = torch.zeros((1, H, W), device=rgb_img.device)
+        bayer = torch.zeros((out_channel, H, W), device=rgb_img.device)
 
         dx, dy = self.offset_map[target_pattern]
+        if out_channel == 1:
+            bayer[0, dx::2, dy::2] = R[dx::2, dy::2]
+            bayer[0, dx::2, 1-dy::2] = G[dx::2, 1-dy::2]
+            bayer[0, 1-dx::2, dy::2] = G[1-dx::2, dy::2]
+            bayer[0, 1-dx::2, 1-dy::2] = B[1-dx::2, 1-dy::2]
 
-        bayer[0, dx::2, dy::2] = R[dx::2, dy::2]
-        bayer[0, dx::2, 1-dy::2] = G[dx::2, 1-dy::2]
-        bayer[0, 1-dx::2, dy::2] = G[1-dx::2, dy::2]
-        bayer[0, 1-dx::2, 1-dy::2] = B[1-dx::2, 1-dy::2]
+        elif out_channel == 4:
+            bayer[0, dx::2, dy::2] = R[dx::2, dy::2]
+            bayer[1, dx::2, 1-dy::2] = G[dx::2, 1-dy::2]
+            bayer[2, 1-dx::2, dy::2] = G[1-dx::2, dy::2]
+            bayer[3, 1-dx::2, 1-dy::2] = B[1-dx::2, 1-dy::2]
+
+        else:
+            raise ValueError("out_channel must be 1 or 4")
 
         return bayer
+    
+    def bayer_1ch_to_4ch(self, bayer_img):
+        """
+        将 Bayer 图像从 1 通道转换为 4 通道
+        输入: bayer_img: (B, 1, H, W) tensor
+        返回: 4 通道的 bayer_img (B, 4, H, W)
+        """
+        B, _, H, W = bayer_img.shape
+        bayer_4ch = torch.zeros((B, 4, H, W), device=bayer_img.device)
+        bayer_4ch[:, 0, :, :] = bayer_img[:, 0, :, :]
+        bayer_4ch[:, 1, :, :] = bayer_img[:, 0, :, :]
+        bayer_4ch[:, 2, :, :] = bayer_img[:, 0, :, :]
+        bayer_4ch[:, 3, :, :] = bayer_img[:, 0, :, :]
 
-def space_to_depth(x, block_size):
-    n, c, h, w = x.size()
-    unfolded_x = torch.nn.functional.unfold(x, block_size, stride=block_size)
-    return unfolded_x.view(n, c * block_size**2, h // block_size,
-                           w // block_size)
+        return bayer_4ch
+
+# def space_to_depth(x, block_size):
+#     n, c, h, w = x.size()
+#     unfolded_x = torch.nn.functional.unfold(x, block_size, stride=block_size)
+#     return unfolded_x.view(n, c * block_size**2, h // block_size,
+#                            w // block_size)
 
 class DataLoader_Imagenet_val(Dataset):
     def __init__(self, data_dir, patch=256):
@@ -350,14 +386,16 @@ def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, 
         print("LearningRate of Epoch {} = {}".format(epoch, current_lr))
 
         network.train()
-        for iteration, noisy in enumerate(TrainingLoader):
+        for iteration, noisy in tqdm(enumerate(TrainingLoader), total=len(TrainingLoader)):
             optimizer.zero_grad()
             shifter = BayerPatternShifter()
 
             # Step 1: I → I_D
-            I = noisy.cuda()  # [N,1,H,W]
-            I_pack = space_to_depth(I, 2)  # [N,3,H/2,W/2]
+            I = noisy.to(device)  # [N,1,H,W]
+            I_pack = shifter.bayer_1ch_to_4ch(I)  # [N,4,H,W] 
+            # print("I_pack shape: ", I_pack.shape)
             I_D = network(I_pack)  # → [N,3,H/2,W/2]
+            exp_loss = torch.mean((I_D - I) ** 2)
 
             # Multi Bayer Pattern Self-Supervised Loop
             if opt.remosaic_mode == 'single':
@@ -369,11 +407,12 @@ def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, 
             total_loss = 0
 
             for pat in patterns:
-                I_i = [shifter.remosaic(rgb, pat) for rgb in I_D]
+                I_i = [shifter.remosaic(rgb, pat, 4) for rgb in I_D]
+                # print("I_i shape: ", I_i[0].shape)
                 I_i = torch.stack(I_i)
-                I_i_pack = space_to_depth(I_i, 2)
-                I_D_tilde = network(I_i_pack)
-                I_hat = [shifter.remosaic(rgb, 'RGGB') for rgb in I_D_tilde]
+                # I_i_pack = space_to_depth(I_i, 2)
+                I_D_tilde = network(I_i)
+                I_hat = [shifter.remosaic(rgb, 'RGGB', 4) for rgb in I_D_tilde]
                 I_hat = torch.stack(I_hat)
                 if opt.use_mask:
                     valid_mask = torch.ones_like(I)
@@ -385,7 +424,16 @@ def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, 
                 else:
                     total_loss += torch.mean((I_hat - I) ** 2)
 
-            loss_all = total_loss / len(patterns)
+            Lambda = epoch / opt.n_epoch
+            if Lambda <= Thread1:
+                beta = Lambda2
+            elif Thread1 <= Lambda <= Thread2:
+                beta = Lambda2 + (Lambda - Thread1) * \
+                    (increase_ratio-Lambda2) / (Thread2-Thread1)
+            else:
+                beta = increase_ratio
+
+            loss_all = total_loss / len(patterns) + beta * exp_loss
             loss_all.backward()
             optimizer.step()
 
@@ -394,6 +442,11 @@ def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, 
         if epoch % opt.n_snapshot == 0 or epoch == opt.n_epoch:
             save_network(network, epoch, "model")
             save_state(epoch, optimizer, scheduler)
+            # print log
+            logger.info("===> Train Epoch[{}]: Loss: {:.6f}".format(epoch, loss_all.item()))
+
+            validate(network, valid_dict, opt, systime, epoch)
+
 
 def validate(network, valid_dict, opt, systime, epoch):
     """Validation loop with RGB prediction and RGB ground truth."""
@@ -416,8 +469,8 @@ def validate(network, valid_dict, opt, systime, epoch):
                 noisy = val_noisy[idx, idy][:, :, np.newaxis]  # shape [H, W, 1]
 
                 transformer = transforms.Compose([transforms.ToTensor()])
-                noisy_tensor = transformer(noisy).unsqueeze(0).cuda()  # [1, 1, H, W]
-                noisy_tensor = space_to_depth(noisy_tensor, 2)  # [1, 4, H/2, W/2]
+                noisy_tensor = transformer(noisy).unsqueeze(0).to(device)  # [1, 1, H, W]
+                # noisy_tensor = space_to_depth(noisy_tensor, 2)  # [1, 4, H/2, W/2]
 
                 with torch.no_grad():
                     pred_rgb = network(noisy_tensor)  # [1, 3, H, W]
@@ -436,10 +489,9 @@ def validate(network, valid_dict, opt, systime, epoch):
         avg_psnr = np.mean(avg_psnr)
         avg_ssim = np.mean(avg_ssim)
 
-        log_path = os.path.join(validation_path, f"A_log_{valid_name}.csv")
-        with open(log_path, "a") as f:
-            f.write(f"epoch:{epoch},psnr:{avg_psnr:.6f},ssim:{avg_ssim:.6f}\n")
-
+        # print log
+        logger.info("===> Validation Epoch[{}]: {} PSNR: {:.6f} dB, SSIM: {:.6f}".format(
+            epoch, valid_name, avg_psnr, avg_ssim))
 
 if __name__ == "__main__":
     # Training Set
@@ -453,7 +505,8 @@ if __name__ == "__main__":
 
     # Validation Set
     valid_dict = {
-        "SIDD_Val": get_SIDD_validation(opt.val_dirs)
+        # "SIDD_Val": get_SIDD_validation(opt.val_dirs),
+        "Kodak24": validation_kodak(opt.val_dirs),
     }
 
     # Network
@@ -462,7 +515,7 @@ if __name__ == "__main__":
                     wf=opt.n_feature)
     if opt.parallel:
         network = torch.nn.DataParallel(network)
-    network = network.cuda()
+    network = network.to(device)
 
     # Training scheme
     num_epoch = opt.n_epoch
@@ -499,6 +552,3 @@ if __name__ == "__main__":
 
     # Training
     train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, opt)
-
-    # Validation
-    validate(network, valid_dict, opt, systime, num_epoch)
