@@ -27,7 +27,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--resume', type=str)
 parser.add_argument('--checkpoint', type=str)
 parser.add_argument('--data_dir', type=str, default='./data/train/SIDD_Medium_Raw_noisy_sub512')
-parser.add_argument('--val_dirs', type=str, default='./data/validation')
+parser.add_argument('--val_dirs', type=str, default='./data/validation/SIDD_Validation_Blocks')
 parser.add_argument('--save_model_path', type=str, default='../experiments/results')
 parser.add_argument('--log_name', type=str, default='b2u_new_mask')
 parser.add_argument('--gpu_devices', default='0', type=str)
@@ -258,6 +258,16 @@ class DataLoader_SIDD_Medium_Raw(Dataset):
 
     def __len__(self):
         return len(self.train_fns)
+    
+def get_SIDD_validation(dataset_dir):
+    val_data_dict = loadmat(
+        os.path.join(dataset_dir, "ValidationNoisyBlocksRaw.mat"))
+    val_data_noisy = val_data_dict['ValidationNoisyBlocksRaw']
+    val_data_dict = loadmat(
+        os.path.join(dataset_dir, 'ValidationGtBlocksRaw.mat'))
+    val_data_gt = val_data_dict['ValidationGtBlocksRaw']
+    num_img, num_block, _, _ = val_data_gt.shape
+    return num_img, num_block, val_data_noisy, val_data_gt
 
 def validation_kodak(dataset_dir):
     fns = glob.glob(os.path.join(dataset_dir, "*"))
@@ -380,7 +390,7 @@ def train(network, optimizer, scheduler, TrainingLoader, epoch_init, num_epoch, 
             save_network(network, epoch, "model")
             save_state(epoch, optimizer, scheduler)
             # print log
-            logger.info("===> Train Epoch[{}]: Loss: {:.6f}".format(epoch, loss_all.item()))
+            logger.info("===> Train Epoch[{}]: Loss: {:.6f}".format(epoch, loss.item()))
 
             validate(network, valid_dict, opt, systime, epoch)
 
@@ -442,8 +452,8 @@ if __name__ == "__main__":
 
     # Validation Set
     valid_dict = {
-        # "SIDD_Val": get_SIDD_validation(opt.val_dirs),
-        "Kodak24": validation_kodak(opt.val_dirs),
+        "SIDD_Val": get_SIDD_validation(opt.val_dirs),
+        # "Kodak24": validation_kodak(opt.val_dirs),
     }
 
     # Network

@@ -28,8 +28,8 @@ python train_new.py \
     --in_channel 4 \
     --out_channel 3 \
     --n_feature 48 \
-    --batchsize 16 \
-    --n_epoch 200 \
-    --warmup_epoch 40 \
+    --batchsize 32 \
+    --n_epoch 100 \
+    --warmup_epoch 20 \
     --use_mask \
     --remosaic_mode 'random'
